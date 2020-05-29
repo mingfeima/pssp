@@ -10,6 +10,8 @@ from transformer.Models import Transformer
 from transformer.Optim import ScheduledOptim
 import transformer.Constants as Constants
 from dataset import TranslationDataset, paired_collate_fn
+import torch.distributed as dist
+import torch.utils.data.distributed
 from utils import args2json, save_model, save_history, show_progress
 
 def toseq(tensor):
@@ -52,16 +54,24 @@ def cal_loss(pred, gold, smoothing):
 
 def prepare_dataloaders(data, opt):
     # ========= Preparing DataLoader =========#
+    train_dataset = TranslationDataset(
+        src_word2idx=data['dict']['src'],
+        tgt_word2idx=data['dict']['tgt'],
+        src_insts=data['train']['src'],
+        tgt_insts=data['train']['tgt'])
+
+    if opt.world_size > 1:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
     train_loader = torch.utils.data.DataLoader(
-        TranslationDataset(
-            src_word2idx=data['dict']['src'],
-            tgt_word2idx=data['dict']['tgt'],
-            src_insts=data['train']['src'],
-            tgt_insts=data['train']['tgt']),
-        num_workers=2,
+        train_dataset,
+        num_workers=opt.num_workers,
         batch_size=opt.batch_size,
         collate_fn=paired_collate_fn,
-        shuffle=True)
+        shuffle=(train_sampler is None),
+        sampler=train_sampler)
 
     valid_loader = torch.utils.data.DataLoader(
         TranslationDataset(
@@ -69,10 +79,10 @@ def prepare_dataloaders(data, opt):
             tgt_word2idx=data['dict']['tgt'],
             src_insts=data['valid']['src'],
             tgt_insts=data['valid']['tgt']),
-        num_workers=2,
+        num_workers=opt.num_workers,
         batch_size=opt.batch_size,
         collate_fn=paired_collate_fn)
-    return train_loader, valid_loader
+    return train_loader, train_sampler, valid_loader
 
 def train_epoch(model, training_data, optimizer, device, smoothing):
     ''' Epoch operation in training phase'''
@@ -113,7 +123,7 @@ def train_epoch(model, training_data, optimizer, device, smoothing):
         n_word_total += n_word
         n_word_correct += n_correct
 
-    print(' time %4.1f' % (timeit.default_timer() - epoch_start))
+    print(' time %4.1f sec' % (timeit.default_timer() - epoch_start))
 
     loss_per_word = total_loss/n_word_total
     accuracy = n_word_correct/n_word_total
@@ -149,7 +159,7 @@ def eval_epoch(model, validation_data, device):
     accuracy = n_word_correct/n_word_total
     return loss_per_word, accuracy
 
-def train(model, training_data, validation_data, optimizer, device, opt):
+def train(model, training_data, train_sampler, validation_data, optimizer, device, opt):
     ''' Start training '''
     log_train_file = None
     log_valid_file = None
@@ -168,18 +178,26 @@ def train(model, training_data, validation_data, optimizer, device, opt):
     history = []
     valid_accus = []
     for e in range(opt.epoch):
-        train_loss, train_accu = train_epoch(model, training_data, optimizer, device, smoothing=opt.label_smoothing)
+        if opt.world_size > 1:
+            train_sampler.set_epoch(e)
+
+        with torch.autograd.profiler.profile(enabled=opt.profile) as prof:
+            train_loss, train_accu = train_epoch(model, training_data, optimizer, device, smoothing=opt.label_smoothing)
+
+        if opt.profile:
+            print(prof.key_averages().table(sort_by="self_cpu_time_total"))
+            exit()
 
         valid_loss, valid_accu = eval_epoch(model, validation_data, device)
 
         history.append([train_loss, train_accu, valid_loss, valid_accu])
         valid_accus += [valid_accu]
 
-        if valid_accu >= max(valid_accus):
+        if valid_accu >= max(valid_accus) and opt.rank == 0:
             save_model(model, opt.result_dir)
             print('[Info] The checkpoint file has been updated.')
 
-        if log_train_file and log_valid_file:
+        if log_train_file and log_valid_file and opt.rank == 0:
             with open(log_train_file, 'a') as log_tf, open(log_valid_file, 'a') as log_vf:
                 log_tf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
                     epoch=e, loss=train_loss,
@@ -190,7 +208,8 @@ def train(model, training_data, validation_data, optimizer, device, opt):
 
         show_progress(e+1, opt.epoch, train_loss, valid_loss, train_accu, valid_accu)
 
-    save_history(history, opt.result_dir)
+    if opt.rank == 0:
+        save_history(history, opt.result_dir)
 
 def main():
     ''' Main function '''
@@ -215,10 +234,24 @@ def main():
     parser.add_argument('-embs_share_weight', action='store_true')
     parser.add_argument('-proj_share_weight', action='store_true')
 
+    # distributed training
+    parser.add_argument('--seed', default=0, type=int,
+                        help='seed for initializing training.')
+    parser.add_argument('-dist_url', default='tcp://224.66.41.62:23456', type=str,
+                        help='url used to set up distributed training')
+    parser.add_argument('-dist_backend', default='gloo', type=str,
+                        help='distributed backend')
+    parser.add_argument('-world_size', default=-1, type=int,
+                        help='number of nodes for distributed training')
+    parser.add_argument('-rank', default=0, type=int,
+                        help='node rank for distributed training')
+
     parser.add_argument('-log', default=None)
     parser.add_argument('-result_dir', type=str, default='./result')
     # parser.add_argument('-save_model', type=str, default='model')
     # parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
+    parser.add_argument('-profile', action='store_true', default=False)
+    parser.add_argument('-num_workers', type=int, default=0)
 
     parser.add_argument('-label_smoothing', action='store_true')
 
@@ -228,11 +261,24 @@ def main():
     os.makedirs(opt.result_dir, exist_ok=True)
     args2json(opt, opt.result_dir)
 
+    #========= Init Distributed ========#
+    torch.manual_seed(opt.seed)
+    opt.distributed = opt.world_size > 1
+
+    if opt.distributed:
+        print("Init distributed backend {}: world size {}; rank {}"
+              .format(opt.dist_backend, opt.world_size, opt.rank))
+        dist.init_process_group(
+            backend=opt.dist_backend,
+            init_method=opt.dist_url,
+            world_size=opt.world_size,
+            rank=opt.rank)
+
     #========= Loading Dataset =========#
     data = torch.load(opt.data)
     opt.max_token_seq_len = data['settings'].max_token_seq_len
 
-    training_data, validation_data = prepare_dataloaders(data, opt)
+    training_data, train_sampler, validation_data = prepare_dataloaders(data, opt)
 
     opt.src_vocab_size = training_data.dataset.src_vocab_size
     opt.tgt_vocab_size = training_data.dataset.tgt_vocab_size
@@ -262,13 +308,16 @@ def main():
         n_head=opt.n_head,
         dropout=opt.dropout).to(device)
 
+    if opt.distributed:
+        transformer = torch.nn.parallel.DistributedDataParallel(transformer, find_unused_parameters=True)
+
     optimizer = ScheduledOptim(
         optim.Adam(
             filter(lambda x: x.requires_grad, transformer.parameters()),
             betas=(0.9, 0.98), eps=1e-09),
         opt.d_model, opt.n_warmup_steps)
 
-    train(transformer, training_data, validation_data, optimizer, device, opt)
+    train(transformer, training_data, train_sampler, validation_data, optimizer, device, opt)
 
 if __name__ == '__main__':
     main()

@@ -5,6 +5,7 @@ __pycache__/
 *.npy.gz
 aa_*.txt
 pss_*.txt
+pssp-data/
 
 # log
 log*
